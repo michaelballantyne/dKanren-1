@@ -744,13 +744,19 @@
 
 (define (goal-value val) (lambda (st) (values st val)))
 (define (denote-value val) (lambda (env) (goal-value val)))
+(define (denote-literal stx)
+  (let ([val (syntax->datum stx)])
+    (lambda (env) (goal-value val))))
 (define denote-true (denote-value #t))
 (define denote-false (denote-value #f))
 (define (denote-lambda params body senv)
-  (match params
-    ((and (not (? symbol?)) params)
-     (let ((dbody (denote-term body (extend-env* params params senv)))
-           (nparams (length params)))
+  (syntax-case params ()
+    [params
+      (not (identifier? #'params))
+      (let ((dbody (denote-term body (extend-env* (syntax->datum #'params)
+                                                  (syntax->datum #'params)
+                                                  senv)))
+           (nparams (length (syntax->datum #'params))))
        (lambda (env)
          (goal-value
            (lambda args
@@ -759,33 +765,37 @@
                  (error
                    (format
                      "expected ~a args, given ~a; params=~v, body=~v, args=~v"
-                     nparams nargs params body args))))
-             (dbody (rev-append args env)))))))
-    (sym
-      (let ((dbody (denote-term body `((val . (,sym . ,sym)) . senv))))
-        (lambda (env) (goal-value (lambda args (dbody (cons args env)))))))))
-(define (denote-variable sym senv)
-  (let loop ((idx 0) (senv senv))
-    (match senv
-      (`((val . (,y . ,b)) . ,rest)
-        (if (equal? sym y)
-          (lambda (env) (goal-value (list-ref env idx)))
-          (loop (+ idx 1) rest)))
-      (`((rec . ,binding*) . ,rest)
-        (let loop-rec ((ridx 0) (binding* binding*))
-          (match binding*
-            ('() (loop (+ idx 1) rest))
-            (`((,p-name ,_) . ,binding*)
-              (if (equal? sym p-name)
-                (lambda (env)
-                  ((list-ref (list-ref env idx) ridx) (drop env idx)))
-                (loop-rec (+ ridx 1) binding*))))))
-      ('() (error (format "unbound variable: '~a'" sym))))))
+                     nparams nargs #'params #'body args))))
+             (dbody (rev-append args env))))))]
+    [sym
+      (let ((dbody (denote-term body `((val . (,(syntax->datum #'sym) . ,(syntax->datum #'sym))) . senv))))
+        (lambda (env) (goal-value (lambda args (dbody (cons args env))))))]))
+(define (denote-variable id senv)
+  (let ([sym (syntax->datum id)])
+    (let loop ((idx 0) (senv senv))
+      (match senv
+        (`((val . (,y . ,b)) . ,rest)
+          (if (equal? sym y)
+            (lambda (env) (goal-value (list-ref env idx)))
+            (loop (+ idx 1) rest)))
+        (`((rec . ,binding*) . ,rest)
+          (let loop-rec ((ridx 0) (binding* binding*))
+            (match binding*
+              ('() (loop (+ idx 1) rest))
+              (`((,p-name ,_) . ,binding*)
+                (if (equal? sym p-name)
+                  (lambda (env)
+                    ((list-ref (list-ref env idx) ridx) (drop env idx)))
+                  (loop-rec (+ ridx 1) binding*))))))
+        ('() (raise-syntax-error #f "unbound variable" id))))))
 
 (define (denote-qq qqterm senv)
-  (match qqterm
-    (`(,'unquote ,term) (denote-term term senv))
-    (`(,a . ,d) (let ((da (denote-qq a senv)) (dd (denote-qq d senv)))
+  (syntax-case qqterm ()
+    [(unquote term)
+     (eq? 'unquote (syntax->datum #'unquote))
+     (denote-term #'term senv)]
+    [(a . d)
+     (let ((da (denote-qq #'a senv)) (dd (denote-qq #'d senv)))
                   (lambda (env)
                     (let ((ga (da env)) (gd (dd env)))
                       (lambda (st)
@@ -793,10 +803,14 @@
                                      ((st va) (actual-value st va #f #f))
                                      ((st vd) (gd st))
                                      ((st vd) (actual-value st vd #f #f)))
-                          (values st `(,va . ,vd))))))))
-    ((? quotable? datum) (denote-value datum))))
+                          (values st `(,va . ,vd)))))))]
+    [datum
+      (if (quotable? (syntax->datum #'datum))
+        (denote-literal #'datum)
+        (raise-syntax-error #f "quasiquoted literal must not contain procedure." qqterm))]))
+
 (define (denote-application proc a* senv)
-  (denote-apply (denote-term proc senv) (denote-term-list a* senv)))
+  (denote-apply (denote-term proc senv) (denote-term-list (syntax->list a*) senv)))
 (define (denote-apply dp da*)
   (lambda (env)
     (let ((gp (dp env)) (ga* (da* env)))
@@ -816,7 +830,8 @@
 
 (define (denote-rhs-pattern-unknown env st v) st)
 (define (denote-rhs-pattern-literal literal)
-  (lambda (env st v) (unify st literal v)))
+  (let ([datum (syntax->datum literal)])
+    (lambda (env st v) (unify st datum v))))
 (define (denote-rhs-pattern-var vname senv)
   (let ((dv (denote-term vname senv)))
     (lambda (env st rhs)
@@ -833,17 +848,23 @@
               (let*/and ((st (unify st v v1)) (st (da env st va)))
                 (dd env st vd)))))))
     ((? quotable? datum) (denote-rhs-pattern-literal datum))))
-(define denote-rhs-pattern-true (denote-rhs-pattern-literal #t))
-(define denote-rhs-pattern-false (denote-rhs-pattern-literal #f))
 (define (denote-rhs-pattern pat senv)
-  (match pat
-    (`(quote ,(? quotable? datum)) (denote-rhs-pattern-literal datum))
-    (`(quasiquote ,qq) (denote-rhs-pattern-qq qq senv))
-    ((? symbol? vname) (denote-rhs-pattern-var vname senv))
-    ((? number? datum) (denote-rhs-pattern-literal datum))
-    (#t denote-rhs-pattern-true)
-    (#f denote-rhs-pattern-false)
-    (_ denote-rhs-pattern-unknown)))
+  (syntax-case pat ()
+    [(quote-sym datum)
+     (eq? 'quote (syntax->datum #'quote-sym))
+     (denote-rhs-pattern-literal #'datum)]
+    [(quasiquote qq)
+     (eq? 'quasiquote (syntax->datum #'quasiquote))
+     (denote-rhs-pattern-qq #'qq senv)]
+    [vname
+      (identifier? #'vname)
+      (denote-rhs-pattern-var #'vname senv)]
+    [datum
+      (number? (syntax->datum #'datum))
+      (denote-rhs-pattern-literal #'datum)]
+    [#t (denote-rhs-pattern-literal pat)]
+    [#f (denote-rhs-pattern-literal pat)]
+    [_ denote-rhs-pattern-unknown]))
 
 (define (extract-svs st v1 v2)
   (let-values (((v1 va1) (walk st v1))
@@ -991,9 +1012,10 @@
 (define (denote-pattern-succeed env) pattern-assert-any)
 (define (denote-pattern-fail env) pattern-assert-none)
 (define (denote-pattern-literal literal penv)
-  (values penv (let ((assert (pattern-assert-==
-                               (pattern-value-literal literal))))
-                 (lambda (env) assert))))
+  (let ([datum (syntax->datum literal)])
+    (values penv (let ((assert (pattern-assert-==
+                                 (pattern-value-literal datum))))
+                   (lambda (env) assert)))))
 (define (denote-pattern-var-extend env) pattern-var-extend)
 (define (denote-pattern-var b* vname penv)
   (let loop ((idx 0) (b* b*))
@@ -1006,34 +1028,39 @@
                          (lambda (env) assert)))
           (loop (+ idx 1) b*))))))
 (define (denote-pattern-qq qqpattern penv senv)
-  (match qqpattern
-    (`(,'unquote ,pat) (denote-pattern pat penv senv))
-    (`(,a . ,d)
-      (let*-values (((penv da) (denote-pattern-qq a penv senv))
-                    ((penv dd) (denote-pattern-qq d penv senv)))
-        (values penv (lambda (env) (pattern-assert-pair (da env) (dd env))))))
-    ((? quotable? datum) (denote-pattern-literal datum penv))))
+  (syntax-case qqpattern ()
+    [(unquote pat)
+     (eq? 'unquote (syntax->datum #'unquote))
+     (denote-pattern #'pat penv senv)]
+    [(a . d)
+     (let*-values (((penv da) (denote-pattern-qq #'a penv senv))
+                   ((penv dd) (denote-pattern-qq #'d penv senv)))
+       (values penv (lambda (env) (pattern-assert-pair (da env) (dd env)))))]
+    [_
+      (quotable? (syntax->datum qqpattern))
+      (denote-pattern-literal qqpattern penv)]))
 (define (denote-pattern-cons apat dpat penv senv)
   (let*-values (((penv da) (denote-pattern apat penv senv))
                 ((penv dd) (denote-pattern dpat penv senv)))
     (values penv (lambda (env) (pattern-assert-pair (da env) (dd env))))))
 
 (define (denote-pattern-or pattern* penv senv)
-  (match pattern*
-    ('() (values penv denote-pattern-fail))
-    (`(,pat) (denote-pattern pat penv senv))
-    (`(,pat . ,pat*)
-      (let*-values (((_ d0) (denote-pattern pat penv senv))
-                    ((_ d*) (denote-pattern-or pat* penv senv)))
-        (values penv (lambda (env) (pattern-assert-or (d0 env) (d* env))))))))
+  (syntax-case pattern* ()
+    [() (values penv denote-pattern-fail)]
+    [(pat) (denote-pattern #'pat penv senv)]
+    [(pat . pat*)
+     (let*-values (((_ d0) (denote-pattern #'pat penv senv))
+                   ((_ d*) (denote-pattern-or #'pat* penv senv)))
+       (values penv (lambda (env) (pattern-assert-or (d0 env) (d* env)))))]))
 (define (denote-pattern* pattern* penv senv)
-  (match pattern*
-    ('() (values penv denote-pattern-succeed))
-    (`(,pat) (denote-pattern pat penv senv))
-    (`(,pat . ,pat*)
-      (let*-values (((penv d0) (denote-pattern pat penv senv))
-                    ((penv d*) (denote-pattern* pat* penv senv)))
-        (values penv (lambda (env) (pattern-assert-and (d0 env) (d* env))))))))
+  (syntax-case pattern* ()
+    [() (values penv denote-pattern-succeed)]
+    [(pat)
+     (denote-pattern #'pat penv senv)]
+    [(pat . pat*)
+     (let*-values (((penv d0) (denote-pattern #'pat penv senv))
+                   ((penv d*) (denote-pattern* #'pat* penv senv)))
+       (values penv (lambda (env) (pattern-assert-and (d0 env) (d* env)))))]))
 ;; TODO: This is wrong, (not a b ...) ==> (and (not a) (not b) ...)
 (define (denote-pattern-not pat* penv senv)
   (let-values (((_ dp) (denote-pattern* pat* penv senv)))
@@ -1041,13 +1068,15 @@
 
 (define (denote-pattern-symbol env) pattern-assert-symbol-==)
 (define (denote-pattern-number env) pattern-assert-number-==)
+
 (define (denote-pattern-type type-tag pat* penv senv)
   (define dty (match type-tag
                 ('symbol denote-pattern-symbol)
                 ('number denote-pattern-number)))
-  (if (null? pat*) (values penv dty)
+  (if (null? (syntax->datum pat*)) (values penv dty)
     (let-values (((penv d*) (denote-pattern* pat* penv senv)))
       (values penv (lambda (env) (pattern-assert-and (dty env) (d* env)))))))
+
 (define (denote-pattern-? predicate pat* penv senv)
   (let ((dpred (denote-term predicate senv)))
     (let-values (((penv d*) (denote-pattern* pat* penv senv)))
@@ -1063,23 +1092,55 @@
                                                       predicate))
                                        (values st result)))))
                            (assert (pattern-assert-predicate pred)))
-                      (if (null? pat*) assert
+                      (if (null? (syntax->datum pat*)) assert
                         (pattern-assert-and assert (d* env)))))))))))
 
+(define-syntax-rule
+  (syntax-case-head-datum stx
+    [(head . rest) body]
+    ...)
+  (syntax-case stx ()
+    [(temp . rest)
+     (eq? 'head (syntax->datum #'temp))
+     body]
+    ...))
+
 (define (denote-pattern pat penv senv)
-  (match pat
-    (`(quote ,(? quotable? datum)) (denote-pattern-literal datum penv))
-    (`(quasiquote ,qqpat) (denote-pattern-qq qqpat penv senv))
-    (`(cons ,apat ,dpat) (denote-pattern-cons apat dpat penv senv))
-    (`(not . ,pat*) (denote-pattern-not pat* penv senv))
-    (`(and . ,pat*) (denote-pattern* pat* penv senv))
-    (`(or . ,pat*) (denote-pattern-or pat* penv senv))
-    (`(symbol . ,pat*) (denote-pattern-type 'symbol pat* penv senv))
-    (`(number . ,pat*) (denote-pattern-type 'number pat* penv senv))
-    (`(? ,predicate . ,pat*) (denote-pattern-? predicate pat* penv senv))
-    ('_ (values penv denote-pattern-succeed))
-    ((? symbol? vname) (denote-pattern-var penv vname penv))
-    ((? quotable? datum) (denote-pattern-literal datum penv))))
+  (syntax-case pat ()
+    [#t (denote-pattern-literal pat penv)]
+    [#f (denote-pattern-literal pat penv)]
+    [num
+      (number? (syntax->datum #'num))
+      (denote-pattern-literal #'num penv)]
+    [underscore
+      (eq? '_ (syntax->datum #'underscore))
+      (values penv denote-pattern-succeed)]
+    [sym
+      (identifier? #'sym)
+      (denote-pattern-var penv (syntax->datum #'sym) penv)]
+    [_ (syntax-case-head-datum pat
+         [(quote datum)
+          (if (quotable? (syntax->datum #'datum))
+            (denote-pattern-literal #'datum penv)
+            (raise-syntax-error #f "datum for quote pattern must not contain procedure" pat))]
+         [(quasiquote qpat)
+          (denote-pattern-qq #'qpat penv senv)]
+         [(cons apat dpat)
+          (denote-pattern-cons #'apat
+                               #'dpat
+                               penv senv)]
+         [(not . pat*)
+          (denote-pattern-not #'pat* penv senv)]
+         [(and . pat*)
+          (denote-pattern* #'pat* penv senv)]
+         [(or . pat*)
+          (denote-pattern-or #'pat* penv senv)]
+         [(symbol . pat*)
+          (denote-pattern-type 'symbol #'pat* penv senv)]
+         [(number . pat*)
+          (denote-pattern-type 'number #'pat* penv senv)]
+         [(? predicate . pat*)
+          (denote-pattern-? #'predicate #'pat* penv senv)])]))
 
 (defrec match-chain scrutinee penv env clauses active?)
 (define (mc-new penv0 env scrutinee clauses active?)
@@ -1271,101 +1332,120 @@
 (define (denote-match pt*-all vt senv active?)
   (let ((dv (denote-term vt senv))
         (pc* (let loop ((pt* pt*-all))
-               (match pt*
-                 ('() '())
-                 (`((,pat ,rhs) . ,clause*)
-                   (let*-values
-                     (((penv dpat) (denote-pattern pat '() senv))
-                      ((ps vs) (split-bindings penv)))
-                     (let* ((senv (extend-env* (reverse ps) (reverse vs) senv))
-                            (drhs (denote-term rhs senv))
-                            (drhspat (denote-rhs-pattern rhs senv))
-                            (pc* (loop clause*)))
-                       (cons (cons dpat (cons drhs drhspat)) pc*))))))))
+               (syntax-case pt* ()
+                 [() '()]
+                 [((pat rhs) . clause*)
+                  (let*-values
+                    (((penv dpat) (denote-pattern #'pat '() senv))
+                     ((ps vs) (split-bindings penv)))
+                    (let* ((senv (extend-env* (reverse ps) (reverse vs) senv))
+                           (drhs (denote-term #'rhs senv))
+                           (drhspat (denote-rhs-pattern #'rhs senv))
+                           (pc* (loop #'clause*)))
+                      (cons (cons dpat (cons drhs drhspat)) pc*)))]))))
     (pattern-match '() dv pc* active?)))
 
-(define and-rhs (cons denote-false denote-rhs-pattern-false))
 (define (denote-and t* senv)
-  (match t*
-    ('() (denote-value #t))
-    (`(,t) (denote-term t senv))
-    (`(,t . ,t*)
-      (let* ((d0 (denote-term t senv))
-             (d* (denote-and t* senv))
-             (clause* (list (cons (lambda (env) pattern-assert-false) and-rhs)
-                            (cons (lambda (env) pattern-assert-any)
-                                  (cons d* denote-rhs-pattern-unknown)))))
+  (syntax-case t* ()
+    [() (denote-literal (datum->syntax t* #t))]
+    [(t) (denote-term #'t senv)]
+    [(t . t*)
+     (let* ((d0 (denote-term #'t senv))
+            (d* (denote-and #'t* senv))
+            (clause* (list (cons (lambda (env) pattern-assert-false)
+                                 (cons (denote-literal (datum->syntax #'t* #f)) (denote-rhs-pattern-literal (datum->syntax #'t* #f))))
+                           (cons (lambda (env) pattern-assert-any)
+                                 (cons d* denote-rhs-pattern-unknown)))))
         (lambda (env)
           (let ((g0 (d0 env)))
             (lambda (st)
               (let*/state (((st v0) (g0 st))
                            ((st v0) (actual-value st v0 #f #f)))
-                (values st (mc-new '() env v0 clause* #t))))))))))
+                (values st (mc-new '() env v0 clause* #t)))))))]))
 (define or-rhs-var (gensym 'or-rhs-var))
 (define or-rhs-params (list or-rhs-var))
 (define (denote-or t* senv)
-  (match t*
-    ('() (denote-value #f))
-    (`(,t) (denote-term t senv))
-    (`(,t . ,t*)
-      (let* ((d0 (denote-term t senv))
-             (d* (denote-or t* senv))
-             (senv1 (extend-env* or-rhs-params or-rhs-params senv))
-             (or-2 (denote-term or-rhs-var senv1))
-             (or-2-pat (denote-rhs-pattern or-rhs-var senv1))
-             (clause* (list (cons (lambda (env) pattern-assert-false)
-                                  (cons d* denote-rhs-pattern-unknown))
-                            (cons (lambda (env) pattern-var-extend)
-                                  (cons or-2 or-2-pat)))))
-        (lambda (env)
-          (let ((g0 (d0 env)))
-            (lambda (st)
-              (let*/state (((st v0) (g0 st))
-                           ((st v0) (actual-value st v0 #f #f)))
-                (values st (mc-new '() env v0 clause* #t))))))))))
+  (syntax-case t* ()
+    [() (denote-literal (datum->syntax t* #f))]
+    [(t) (denote-term #'t senv)]
+    [(t . t*)
+     (let* ((d0 (denote-term #'t senv))
+            (d* (denote-or #'t* senv))
+            (senv1 (extend-env* or-rhs-params or-rhs-params senv))
+            (or-2 (denote-term (datum->syntax #'t or-rhs-var) senv1))
+            (or-2-pat (denote-rhs-pattern (datum->syntax #'t or-rhs-var) senv1))
+            (clause* (list (cons (lambda (env) pattern-assert-false)
+                                 (cons d* denote-rhs-pattern-unknown))
+                           (cons (lambda (env) pattern-var-extend)
+                                 (cons or-2 or-2-pat)))))
+       (lambda (env)
+         (let ((g0 (d0 env)))
+           (lambda (st)
+             (let*/state (((st v0) (g0 st))
+                          ((st v0) (actual-value st v0 #f #f)))
+                         (values st (mc-new '() env v0 clause* #t)))))))]))
 
 (define (denote-fresh vsyms body senv)
-  (let ((db (denote-term body (extend-env* vsyms vsyms senv))))
+  (let ((db (denote-term body (extend-env* (syntax->datum vsyms) (syntax->datum vsyms) senv))))
     (lambda (env)
       (let ((vs (map (lambda (vsym) (var (gensym (symbol->string vsym))))
-                     vsyms)))
+                     (syntax->datum vsyms))))
         (db (rev-append vs env))))))
 
 (define (denote-term term senv)
   (let ((bound? (lambda (sym) (in-env? senv sym))))
-    (match term
-      (#t (denote-value #t))
-      (#f (denote-value #f))
-      ((? number? num) (denote-value num))
-      ((? symbol? sym) (denote-variable sym senv))
-      ((and `(,op . ,_) operation)
-       (match operation
-         (`(,(or (? bound?) (not (? symbol?))) . ,rands)
-           (denote-application op rands senv))
-         (`(quote ,(? quotable? datum)) (denote-value datum))
-         (`(quasiquote ,qqterm) (denote-qq qqterm senv))
-         (`(if ,condition ,alt-true ,alt-false)
-           (denote-match `((#f ,alt-false) (_ ,alt-true)) condition senv #t))
-         (`(lambda ,params ,body) (denote-lambda params body senv))
-         (`(let ,binding* ,let-body)
-           (let-values (((ps vs) (split-bindings binding*)))
-             (denote-apply (denote-lambda ps let-body senv)
-                           (denote-term-list vs senv))))
-         (`(letrec ,binding* ,letrec-body)
-           (let* ((rsenv `((rec . ,binding*) . ,senv))
-                  (dbody (denote-term letrec-body rsenv))
-                  (db* (let loop ((binding* binding*))
-                         (match binding*
-                           ('() '())
-                           (`((,_ (lambda ,params ,body)) . ,b*)
-                             (cons (denote-lambda params body rsenv)
-                                   (loop b*)))))))
-             (lambda (env) (dbody (cons db* env)))))
-         (`(and . ,t*) (denote-and t* senv))
-         (`(or . ,t*) (denote-or t* senv))
-         (`(match ,scrutinee . ,pt*) (denote-match pt* scrutinee senv #t))
-         (`(match/lazy ,scrutinee . ,pt*) (denote-match pt* scrutinee senv #f))
-         (`(fresh ,vars ,body) (denote-fresh vars body senv)))))))
+    (syntax-case term ()
+      [#t (denote-literal term)]
+      [#f (denote-literal term)]
+      [num
+        (number? (syntax->datum #'num))
+        (denote-literal #'num)]
+      [sym
+        (identifier? #'sym)
+        (denote-variable #'sym senv)]
+      [(rator . rands)
+       (or (bound? (syntax->datum #'rator))
+           (not (identifier? #'rator)))
+       (denote-application #'rator #'rands senv)]
+      [_ (syntax-case-head-datum term
+           [(quote datum)
+            (if (quotable? (syntax->datum #'datum))
+              (denote-literal #'datum)
+              (raise-syntax-error #f "argument to quote must not contain procedure." term))]
+           [(quasiquote qqterm)
+            (denote-qq #'qqterm senv)]
+           [(if condition alt-true alt-false)
+            (denote-match #'((#f alt-false) (_ alt-true))
+                          #'condition senv #t)]
+           [(lambda params body)
+            (denote-lambda #'params
+                           #'body
+                           senv)]
+           [(let binding* let-body)
+            (let-values (((ps vs) (split-bindings-stx #'binding*)))
+              (denote-apply (denote-lambda ps #'let-body senv)
+                            (denote-term-list vs senv)))]
+           [(letrec binding* letrec-body)
+            (let* ((rsenv `((rec . ,(syntax->datum #'binding*)) . ,senv))
+                   (dbody (denote-term #'letrec-body rsenv))
+                   (db* (let loop ((binding* #'binding*))
+                          (syntax-case binding* ()
+                            [() '()]
+                            [((_ (lambda params body)) . b*)
+                             (eq? 'lambda (syntax->datum #'lambda))
+                             (cons (denote-lambda #'params #'body rsenv)
+                                   (loop #'b*))]))))
+              (lambda (env) (dbody (cons db* env))))]
+           [(and . t*)
+            (denote-and #'t* senv)]
+           [(or . t*)
+            (denote-or #'t* senv)]
+           [(match scrutinee . pt*)
+            (denote-match #'pt* #'scrutinee senv #t)]
+           [(match/lazy scrutinee . pt*)
+            (denote-match #'pt* #'scrutinee senv #f)]
+           [(fresh vars body)
+            (denote-fresh #'vars #'body senv)])])))
 
 (define (in-env? env sym)
   (match env
@@ -1402,12 +1482,20 @@
     ('() #t)
     (`((,p ,v) . ,b*) (bindings? b*))
     (_ #f)))
+
 (define (split-bindings b*)
   (match b*
     ('() (values '() '()))
     (`((,param ,val) . ,b*)
       (let-values (((ps vs) (split-bindings b*)))
         (values (cons param ps) (cons val vs))))))
+
+(define (split-bindings-stx b*)
+  (syntax-case b* ()
+    [() (values '() '())]
+    [((param val) . b*)
+     (let-values (((ps vs) (split-bindings-stx #'b*)))
+       (values (cons #'param ps) (cons #'val vs)))]))
 
 (define (match-clauses? pt* env)
   (define (pattern-var? b* vname ps)
@@ -1504,12 +1592,15 @@
 ;; 'dk-term' must be a valid dKanren program, *not* just any miniKanren term.
 ;; 'result' is a miniKanren term.
 (define (dk-evalo dk-term expected)
-  (let ((dk-goal (eval-term dk-term initial-env)))
-    (lambda (st)
-      (reset-cost
-        (let-values (((st result) (dk-goal st)))
-          (and st (let-values (((st _) (actual-value st result #t expected)))
-                    st)))))))
+  (let ([dk-term (if (syntax? dk-term)
+                   dk-term
+                   (datum->syntax #'datum-term dk-term))])
+    (let ((dk-goal (eval-term dk-term initial-env)))
+      (lambda (st)
+        (reset-cost
+          (let-values (((st result) (dk-goal st)))
+            (and st (let-values (((st _) (actual-value st result #t expected)))
+                      st))))))))
 
 (define (primitive params body)
   (let-values (((st v) (((denote-lambda params body '()) '()) #t)))
@@ -1518,30 +1609,30 @@
       v)))
 
 (define empty-env '())
-(define initial-env `((val . (cons . ,(primitive '(a d) '`(,a . ,d))))
-                      (val . (car . ,(primitive '(x) '(match x
+(define initial-env `((val . (cons . ,(primitive #'(a d) #'`(,a . ,d))))
+                      (val . (car . ,(primitive #'(x) #'(match x
                                                         (`(,a . ,d) a)))))
-                      (val . (cdr . ,(primitive '(x) '(match x
+                      (val . (cdr . ,(primitive #'(x) #'(match x
                                                         (`(,a . ,d) d)))))
-                      (val . (null? . ,(primitive '(x) '(match x
+                      (val . (null? . ,(primitive #'(x) #'(match x
                                                           ('() #t)
                                                           (_ #f)))))
-                      (val . (pair? . ,(primitive '(x) '(match x
+                      (val . (pair? . ,(primitive #'(x) #'(match x
                                                           (`(,a . ,d) #t)
                                                           (_ #f)))))
-                      (val . (symbol? . ,(primitive '(x) '(match x
+                      (val . (symbol? . ,(primitive #'(x) #'(match x
                                                             ((symbol) #t)
                                                             (_ #f)))))
-                      (val . (number? . ,(primitive '(x) '(match x
+                      (val . (number? . ,(primitive #'(x) #'(match x
                                                             ((number) #t)
                                                             (_ #f)))))
-                      (val . (not . ,(primitive '(x) '(match x
+                      (val . (not . ,(primitive #'(x) #'(match x
                                                         (#f #t)
                                                         (_ #f)))))
-                      (val . (equal? . ,(primitive '(x y) '(match `(,x . ,y)
+                      (val . (equal? . ,(primitive #'(x y) #'(match `(,x . ,y)
                                                              (`(,a . ,a) #t)
                                                              (_ #f)))))
-                      (val . (list . ,(primitive 'x 'x)))
+                      (val . (list . ,(primitive #'x #'x)))
                       . ,empty-env))
 
 (module+ test
